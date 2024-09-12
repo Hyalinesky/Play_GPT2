@@ -773,3 +773,196 @@ for i in range(50):
   ```
 
   优化了8%左右
+
+## 3. 进一步优化
+
+### 3.1 像GPT3一样设置参数
+
+#### 3.1.1 设置Adam参数
+
+```py
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+```
+
+#### 3.1.2 梯度裁剪
+
+在反向传播后添加以下这一行
+
+```
+loss.backward()
+norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+```
+
+- 该函数计算所有参数梯度的总范数(L2范数),并将其缩放,使得总范数不超过指定的最大值(这里是1.0)。函数返回裁剪前的原始梯度范数,这里赋值给了`norm`变量。
+- 作用：防止梯度爆炸
+- Karpathy说，他喜欢将clip_grad_norm_返回的范数可视化，因为它是有用的信息。**如果梯度的范数不断攀升，模型训练就很糟糕，可能导致不稳定。如果看到范数出现一个峰值，可能表示出现了不稳定的情况。**我们在print处加一个norm指标来打印范数
+
+#### 3.1.3 学习率
+
+gpt训练采用的学习率是从余弦函数改造的，大体如下图所示：
+
+<img src="C:\Users\16273\AppData\Roaming\Typora\typora-user-images\image-20240912164352028.png" alt="image-20240912164352028" style="zoom:80%;" />
+
+**学习率函数：**
+
+```py
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1)/warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min leaning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+```
+
+- 1) 预热阶段（Warm-up）：在训练开始的 `warmup_steps` 步内，学习率从接近0线性增加到 `max_lr`。这有助于稳定初期的训练过程。
+  2) 最小学习率阶段：当迭代次数超过 `max_steps` 时，返回最小学习率 `min_lr`。
+  3) 余弦退火阶段（Cosine Annealing）：在预热阶段之后到 `max_steps` 之前，学习率按余弦函数从 `max_lr` 逐渐降低到 `min_lr`。
+
+**训练循环：**
+
+```py
+for step in range(max_steps):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+    loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+    optimizer.step()
+    torch.cuda.synchronize() # 等待gpu完成所有工作
+    t1 = time.time()
+    dt = t1-t0
+    print(f"step {i}, loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms")
+```
+
+- 说明：在gpt3中，max_steps是比训练伦次要少的，也就是说训练中存在epoch（在较后期）以min_lr训练。但在我们的代码中，训练轮次设置为max_steps，表示训练中没有以min_lr为学习率的epoch。
+
+#### 3.1.4  growing Batch
+
+- gpt3逐步增加了batch大小。batch随着训练轮次的增加线性上升，开始以一个小batch训练，渐渐增加到一个大的batch
+- 这似乎是合理的，解释有很多（不仅限于以下解释）
+  - warmup阶段采用小batch可以频繁更新参数，有助于快速探索参数空间
+  - 小batch在早期阶段提供更多的随机性，有助于模型学习数据的多样性
+  - 小batch在训练初期提供更多的噪声，有助于逃离局部最优解，增加模型的泛化能力
+
+- 本文并不复现这一操作。因为这很麻烦。
+
+#### 3.1.5 权重衰减
+
+权重衰减是正则化，避免单个权重非常大。
+
+修改优化器为自定义的优化器：
+
+```
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+```
+
+在模型内部添加一个优化器函数：
+
+```py
+import inspect
+
+class GPT(nn.Module):
+    # ...
+
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
+```
+
+- 一维向量不参与权重衰减，我们只对参与矩阵乘法的权重进行衰减，以及对embedding的权重衰减
+
+#### 3.1.6 梯度累积
+
+- 当我们想以一个很大的batch训练时，显存往往是不够的。gpt3使用0.5M个toens为一个batch，这需要我们将B设置为488左右。这在一个gpu上是几乎实现不了的。
+
+- 梯度累积指的是，在反向传播后不要直接更新参数，而是将梯度保留。在运行若干个迷你batch后，梯度会累加，最终一次性更新参数。
+
+- 实现：
+
+  ```py
+  # train_loader = DataLoaderLite(B=16, T=1024)
+  total_batch_size = 524288 # 2^19 ≈0.5M
+  B = 16 # micro batch
+  T = 1024 # sequence length
+  assert total_batch_size % (B*T) == 0, "make sure total_batch_size is divisible by B*T"
+  grad_accum_steps = total_batch_size // (B * T)
+  print(f"total desired batch size: {total_batch_size}")
+  print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+  
+  train_loader = DataLoaderLite(B=B, T=T)
+  ```
+
+  ```py
+  for step in range(max_steps):
+      t0 = time.time()
+      optimizer.zero_grad()
+  
+      loss_accum = 0.0
+      for micro_step in range(grad_accum_steps):
+          x, y = train_loader.next_batch()
+          x, y = x.to(device), y.to(device)
+          with torch.autocast(device_type=device, dtype=torch.bfloat16):
+          	logits, loss = model(x, y)
+  
+          loss = loss / grad_accum_steps
+          loss_accum += loss.detach()
+          loss.backward()
+      norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+      
+      lr = get_lr(step)
+      for param_group in optimizer.param_groups:
+          param_group['lr'] = lr
+  
+      optimizer.step()
+      torch.cuda.synchronize() # 等待gpu完成所有工作
+      t1 = time.time()
+      dt = t1-t0
+      print(f"step {step}, loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms")
+  ```
+
+  - 注意：`loss = loss / grad_accum_steps`表示，在梯度累积时需要除以执行micro_step的次数。因为在执行1个n批次和n个1批次时，区别在于执行n个1批次需要累加梯度，但次累加并不会默认归一化，这就会导致与执行1个n批次的损失结果**相差n倍**
+  - `optimizer.step()`更新参数。因此只有一个epoch才更新一次参数，该次更新累积了grad_accum_steps次梯度
+
+
+
