@@ -964,5 +964,165 @@ class GPT(nn.Module):
   - 注意：`loss = loss / grad_accum_steps`表示，在梯度累积时需要除以执行micro_step的次数。因为在执行1个n批次和n个1批次时，区别在于执行n个1批次需要累加梯度，但次累加并不会默认归一化，这就会导致与执行1个n批次的损失结果**相差n倍**
   - `optimizer.step()`更新参数。因此只有一个epoch才更新一次参数，该次更新累积了grad_accum_steps次梯度
 
+### 3.2 分布式多卡训练 DDP
 
+指令：`torchrun --standalone --nproc_per_node=4 train_gpt2.py`
 
+#### 3.2.1 初始化ddp
+
+```py
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+# device = "cuda" if torch.cuda.is_available() else "cpu"
+# print(f'using device: {device}') 
+
+# DDP
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl') # 初始化进程组，使用NCCL后端
+    ddp_rank = int(os.environ['RANK']) # 获取当前进程的全局rank。在分布式环境中，每个进程都有一个唯一的rank。
+    ddp_local_rank = int(os.environ['LOCAL_RANK']) # 当前进程（GPU）在本地机器上的rank
+    ddp_world_size = int(os.environ['WORLD_SIZE']) # 总进程数（世界大小）
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # 主进程，用于打印一些内容等
+else:
+    ddp_rank = 0 
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f'using device: {device}')  
+```
+
+#### 3.2.2 修改训练代码
+
+1. micro batch分配
+
+   ```py
+   assert total_batch_size % (B*T*ddp_world_size) == 0, "make sure total_batch_size is divisible by B*T*ddp_world_size"
+   grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+   if master_process:
+       print(f"total desired batch size: {total_batch_size}")
+       print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+   ```
+
+2. 数据加载
+
+   ```py
+   # train_loader = DataLoaderLite(B=B, T=T)
+   train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+   ```
+
+   ```python
+   class DataLoaderLite:
+       def __init__(self, B, T, process_rank, num_processes):
+           self.B = B
+           self.T = T
+           self.process_rank = process_rank
+           self.num_processes = num_processes
+   
+           with open('data/shakespeare_char/input.txt', 'r') as f:
+               text = f.read()
+           enc = tiktoken.get_encoding('gpt2')
+           tokens = enc.encode(text)
+           self.tokens = torch.tensor(tokens)
+           print(f"loaded {len(self.tokens)} tokens")
+   
+           self.current_position = self.B * self.T * self.process_rank
+   
+       def next_batch(self):
+           B, T = self.B, self.T
+           buf = self.tokens[self.current_position : self.current_position+B*T+1]
+           x = (buf[:-1]).view(B,T)
+           y = (buf[1:]).view(B,T)
+           self.current_position +=B*T*self.num_processes
+   
+           if self.current_position + (B*T*self.num_processes+1) > len(self.tokens):
+               self.current_position = self.B * self.T * self.process_rank
+           return x, y
+   ```
+
+   - 注意：每个进程从不同的起始位置开始读取数据：`self.current_position = self.B * self.T * self.process_rank`
+     - 从 `current_position` 开始，读取 `B*T+1` 个tokens。
+     - 更新 `current_position`，跳过其他进程的数据：`self.current_position += B*T*self.num_processes`
+
+3. 将模型分装到分布式容器
+
+   ```py
+   model = GPT(GPTConfig())
+   model.to(device)
+   model = torch.compile(model)
+   if ddp:
+       model = DDP(model, device_ids=[ddp_local_rank])
+   ```
+
+   - 在最简单的设置中，一旦每个独立GPU上的反向传播结束，每个GPU都会拥有所有参数的梯度。DDP在这里做的是：一旦反向传播结束，它会调用`all_reduce`，**对所有梯度求平均值，然后将该平均值存储在每个GPU（Rank）上，因此每个Rank都会得到平均值**。
+
+4. 反向传播同步时机优化
+
+   在`for step in range(max_steps):`循环中修改：
+
+   ```py
+   if ddp:
+   	model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+   loss.backward()
+   ```
+
+   - DDP默认会在反向传播后同步各个Rank（GPU）上的参数梯度。但由于我们使用了梯度累积，我们其实只希望在最后一次micro step结束后同步梯度，因为这样会减少不必要的通信损耗。
+   - 这段代码让DDP只有在micro_step == grad_accum_steps - 1时才同步梯度。
+
+5. loss同步
+
+   ```py
+   if ddp:
+   	dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+   norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+   ```
+
+   - 与反向传播不同，DDP中并不会自动同步loss，因此需要我们手动处理，调用`all_reduce`计算所有Rank（GPU）上loss的平均值并将它们存储到每一个Rank上
+
+6. 打印主进程结果
+
+   ```py
+   if master_process:
+   	print(f"step {step}, loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms")
+   ```
+
+7. 销毁进程组
+
+   将这段代码添加到最后（训练循环的循环外面）
+
+   ```python
+   if ddp:
+       destroy_process_group()
+   ```
+
+8. 修改一些bug
+
+   1. **BUG 1**
+
+      ```py
+      raw_model = model  # 保存原始模型的引用
+      if ddp:
+          model = DDP(model, device_ids=[ddp_local_rank])
+      ```
+
+      ```
+      optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+      ```
+
+      - 这里是因为DDP在包装model时，导致了model内的函数configure_optimizers没有被暴露出来。因此直接用`model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)`会报错找不到`configure_optimizers`函数。因此我们保存了原始的model，并在此处调用原始model的引用，而不是DDP包装的model。
+
+   2. **BUG 2**
+
+      ```py
+      device_type = device.split(':')[0]  # 这会从 'cuda:0' 中提取 'cuda'
+      with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+      	logits, loss = model(x, y)
+      ```
+
+      - 我没有意识到视频什么时候修改了这里。出错原因是autocast函数只接收'cuda'/'cpu'，而我们的device是'cuda: {id}',例如'cuda: 0'
