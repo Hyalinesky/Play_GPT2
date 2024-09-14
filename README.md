@@ -6,6 +6,10 @@
 
 b站视频：[【精校】“让我们重现GPT-2（1.24亿参数）!”AI大神Andrej Karpathy最新4小时经典教程 【中英】_哔哩哔哩_bilibili](https://www.bilibili.com/video/BV12s421u7sZ/?spm_id_from=333.1007.top_right_bar_window_custom_collection.content.click&vd_source=48aaa0d1fc3b556c23a01feba661a1ee)
 
+视频对应的项目地址（直到我快要完成整个项目时我才意识到这才是视频对应的项目地址，最上方的项目是旧的版本）：https://github.com/karpathy/build-nanogpt.git
+
+**本项目**运行的文件只有train_gpt2.py
+
 ## 1. Before we start
 
 ### 1.1 让我们先了解gpt2的框架设计
@@ -1126,3 +1130,467 @@ else:
       ```
 
       - 我没有意识到视频什么时候修改了这里。出错原因是autocast函数只接收'cuda'/'cpu'，而我们的device是'cuda: {id}',例如'cuda: 0'
+
+## 4. 训练 on OpenWebText
+
+直到此时我才意识到这才是视频对应的项目地址（https://github.com/karpathy/build-nanogpt.git），原本的项目是旧的版本，并非视频对应的手把手搭建版本。我们可以运行fineweb.py下载数据集，但我的版本中我修改了保存的绝对路径以适用于我的服务器。
+
+假定数据集被下载到`/public/cx/nanogpt/openwebtext`路径下
+
+### 4.1 修改train代码
+
+#### 4.1.1 修改dataloader
+
+```py
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
+class DataLoaderLite:
+    def __init__(self, B, T, process_rank, num_processes, split):
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
+        data_root = "/public/cx/nanogpt/openwebtext"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B,T)
+        y = (buf[1:]).view(B,T)
+        self.current_position +=B*T*self.num_processes
+
+        if self.current_position + (B*T*self.num_processes+1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
+        return x, y
+```
+
+- 因为数据被拆分成shards存储因此在加载数据时需要额外处理shard。当一个shard被处理完就会加载下一个shard，循环往复。
+- def load_tokens(filename)函数相较于视频中做了修改，因为直接转换tensor会导致报错。Karpathy在github项目中给出了修改
+
+#### 4.1.2 修改epoch参数
+
+```py
+warmup_steps = 715
+max_steps = 19073
+```
+
+- `max_steps`: 由于数据集包含100亿（10e9）个token，而一个batch在上文中设置为2^19个token。10e9/2**19≈19073。因此这里取19073为训练epoch数。
+- `warmup_steps`：gpt3论文声明他们用3.75亿个token预热学习率。375e6/2**19≈715。
+  - 实际上`warmup_stepske`可以设置得更小，这样会更激进，但实际上可能是足够的。但这里我们复现gpt3的训练设置。
+
+#### 4.1.3 修改trainloader
+
+```py
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+```
+
+- 完成这一步后可以运行`torchrun --standalone --nproc_per_node=4 train_gpt2.py`
+
+### 4.2 Validation
+
+#### 4.1.1 添加val_loader
+
+```py
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+```
+
+#### 4.1.2 修改Dataloader
+
+```python
+class DataLoaderLite:
+    def __init__(self, B, T, process_rank, num_processes, split):
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
+        data_root = "/public/cx/nanogpt/openwebtext"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        self.reset()     
+
+    def reset(self):
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+```
+
+- 添加了`def reset(self):`主要用于在训练主循环中调用
+
+#### 4.1.3 修改训练主循环
+
+```py
+enc = tiktoken.get_encoding('gpt2')
+
+total_batch_size = 524288 # 2^19 ≈0.5M
+```
+
+- 为了在val的同时运行模型查看文本生成结果，添加`enc = tiktoken.get_encoding('gpt2')`代码，可以加到定义`total_batch_size`之前
+
+根据以下内容修改训练主循环：
+
+```py
+for step in range(max_steps):
+    t0 = time.time()
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                device_type = device.split(':')[0]  # 这会从 'cuda:0' 中提取 'cuda'
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            
+    if step > 0 and step % 100 == 0:
+        model.eval()
+        num_return_sequences = 4  # 设置生成的序列数量
+        max_length = 32  # 设置生成文本的最大长度
+        tokens = enc.encode("Hello, I'm a language model,") 
+        tokens = torch.tensor(tokens, dtype=torch.long) 
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # 复制输入序列以生成多个样本
+        xgen = tokens.to(device)  
+        sample_rng = torch.Generator(device=device)  # 创建随机数生成器
+        sample_rng.manual_seed(42 + ddp_rank)  # 设置随机种子，确保可重复性
+
+        while xgen.size(1) < max_length:  # 循环直到达到最大长度
+            with torch.no_grad():
+                logits, loss = model(xgen)  # 使用模型生成下一个词的概率分布
+                logits = logits[:, -1, :]  # 只关注最后一个时间步的输出
+                probs = F.softmax(logits, dim=-1)  # 将logits转换为概率
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)  # 选择前50个最可能的词
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)  # 从top-k中随机选择一个词
+                xcol = torch.gather(topk_indices, -1, ix)  # 获取选中词的索引
+                xgen = torch.cat((xgen, xcol), dim=1)  # 将新生成的词添加到序列中
+
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens) 
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
+    
+    model.train()
+    optimizer.zero_grad()
+    loss_accum = 0.0
+    # ...
+```
+
+- **注意：**视频提到，如果要运行generation的代码（即中文注释的部分），需要禁用`torch_compile`，即注释掉前面的`model = torch.compile(model)`。截止至视频发布这个问题没有被解决，我粗略的浏览了项目仓库的代码，似乎这个bug仍然没有很好的解决方案。如果希望使用`torch_compile`，可能就不能即时进行文本生成。你可以注释掉相关代码或将`if`条件设为False。
+
+  ```py
+  # model = torch.compile(model)
+  ```
+
+  - 然而，实际使用中我似乎并没有出现报错。可能是torch版本的问题，或者pytorch已经修复了bug。
+
+- 还需要注意的是，我们在设置`GPTConfig`时，为了优化训练速度，将`vocab_size`设置为50304。这可能导致一个问题，在模型没有收敛时，尤其是前几个epoch，模型可能只是一个随机数模型。这就意味着它可能生成不在词汇表中的token。因此，更好的处理是按以下方式进一步修改代码：
+
+  ```py
+  for i in range(num_return_sequences):
+  	tokens = xgen[i, :max_length].tolist()
+  	# 使用更安全的解码方法
+  	decoded = ""
+  	for token in tokens:
+  		if token < 50257:
+  			try:
+  				decoded += enc.decode([token])
+  			except:
+  				decoded += '[UNK]'
+  		else:
+  			decoded += '[UNK]'
+  	print(f"rank {ddp_rank} sample {i}: {decoded}")
+  ```
+
+  - 50257是gpt2真实的词汇表长度
+
+## 5. Evaluation
+
+- Hellaswag是一个用于评估语言模型能力的benchmark。它是一些多选题，题目包含一段文本，选项是文本的延续，只有一个正确答案。人类能够分辨大部分的正确答案（95%），但机器只有40%的准确率（在2019年论文提出的时候）
+- 处理Hellaswag的脚本在https://github.com/karpathy/build-nanogpt.git
+
+### 5.1 修改代码
+
+#### 5.1.1 添加日志
+
+以下代码添加在训练循环`for step in range(max_steps):`开始前：
+
+```py
+log_dir = 'log'
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f:
+    pass
+```
+
+以下代码添加在训练代码末尾
+
+```py
+if master_process:
+	print(f"step {step}, loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms")
+	with open(log_file, "a") as f:
+		f.write(f"{step} train {loss_accum.item():.6f}\n")
+```
+
+#### 5.1.2 修改训练主循环
+
+添加以下代码到训练循环中，可以放在val loss和generation中间
+
+```py
+from hellaswag import render_example, iterate_examples
+
+# once in a while evaluate hellaswag
+	last_step = (step == max_steps - 1)
+    if step % 100 == 0 or last_step:
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and labels
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
+```
+
+- 注意import。此外，我修改了hellaswag.py文件存储的路径。
+
+以下代码也需要被添加，可以放在所有class定义的最后：
+
+```py
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+```
+
+- 这段代码用于检测4个选项文本中哪个生成置信度最高：从给定的多个文本序列（通常是不同的模型生成的文本候选）中，找出最可能的序列。
+
+  
+
+然后，因为现在有了日志，我们最好将val loss也写入日志。可以修改为以下代码：
+
+```py
+# once in a while evaluate our validation loss
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                device_type = device.split(':')[0]  # 这会从 'cuda:0' 中提取 'cuda'
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+```
+
+### 5.2 结果可视化
+
+绘图代码
+
+```py
+# parse and visualize the logfile
+import numpy as np
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+sz = "124M"
+
+loss_baseline = {
+    "124M": 3.2924,
+}[sz]
+hella2_baseline = { # HellaSwag for GPT-2
+    "124M": 0.294463,
+    "350M": 0.375224,
+    "774M": 0.431986,
+    "1558M": 0.488946,
+}[sz]
+hella3_baseline = { # HellaSwag for GPT-3
+    "124M": 0.337,
+    "350M": 0.436,
+    "774M": 0.510,
+    "1558M": 0.547,
+}[sz]
+
+# load the log file
+with open("log124M_40B/log.txt", "r") as f:
+    lines = f.readlines()
+
+# parse the individual lines, group by stream (train,val,hella)
+streams = {}
+for line in lines:
+    step, stream, val = line.strip().split()
+    if stream not in streams:
+        streams[stream] = {}
+    streams[stream][int(step)] = float(val)
+
+# convert each stream from {step: val} to (steps[], vals[])
+# so it's easier for plotting
+streams_xy = {}
+for k, v in streams.items():
+    # get all (step, val) items, sort them
+    xy = sorted(list(v.items()))
+    # unpack the list of tuples to tuple of lists
+    streams_xy[k] = list(zip(*xy))
+
+# create figure
+plt.figure(figsize=(16, 6))
+
+# Panel 1: losses: both train and val
+plt.subplot(121)
+xs, ys = streams_xy["train"] # training loss
+ys = np.array(ys)
+plt.plot(xs, ys, label=f'nanogpt ({sz}) train loss')
+print("Min Train Loss:", min(ys))
+xs, ys = streams_xy["val"] # validation loss
+plt.plot(xs, ys, label=f'nanogpt ({sz}) val loss')
+# horizontal line at GPT-2 baseline
+if loss_baseline is not None:
+    plt.axhline(y=loss_baseline, color='r', linestyle='--', label=f"OpenAI GPT-2 ({sz}) checkpoint val loss")
+plt.xlabel("steps")
+plt.ylabel("loss")
+plt.yscale('log')
+plt.ylim(top=4.0)
+plt.legend()
+plt.title("Loss")
+print("Min Validation Loss:", min(ys))
+
+# Panel 2: HellaSwag eval
+plt.subplot(122)
+xs, ys = streams_xy["hella"] # HellaSwag eval
+ys = np.array(ys)
+plt.plot(xs, ys, label=f"nanogpt ({sz})")
+# horizontal line at GPT-2 baseline
+if hella2_baseline:
+    plt.axhline(y=hella2_baseline, color='r', linestyle='--', label=f"OpenAI GPT-2 ({sz}) checkpoint")
+if hella3_baseline:
+    plt.axhline(y=hella3_baseline, color='g', linestyle='--', label=f"OpenAI GPT-3 ({sz}) checkpoint")
+plt.xlabel("steps")
+plt.ylabel("accuracy")
+plt.legend()
+plt.title("HellaSwag eval")
+print("Max Hellaswag eval:", max(ys))
+```
+
+![image-20240913205102843](C:\Users\16273\AppData\Roaming\Typora\typora-user-images\image-20240913205102843.png)
+
+- 图表说明
+  - 红色是gpt2 baseline
+  - 蓝色是训练损失/acc
+  - 橙色是验证损失
+- nanogpt超越了gpt2的表现，可能的原因如下
+  - gpt2在更广泛的数据集上训练，可能是多语言的、包含数学、代码的；而nanogpt只是在英语数据集上训练，不包含数学、代码等
+  - Halleswag是一个2019年的数据集，数据集中的内容有可能已经由某种形式泄漏到openwebtext数据集当中
+  - ...
+- 实验结果的一些问题
+  - 作图loss中，在接近5000steps出现了一次loss的**突变**。Karpathy认为有可能是openwebtext没有被正确的打乱，它可能继承了一些训练集中的顺序。
+
+![image-20240913210701820](C:\Users\16273\AppData\Roaming\Typora\typora-user-images\image-20240913210701820.png)
+
+- 这张图片为epoch进一步提升4倍后训练的结果。可以看到效果仍然在提升，而且loss中的“**突变**”呈现更明显的周期性。
+- 需要改进的是，dataloader加载数据时在读完文件后会返回文件开头重新读，这其中缺少一个**打乱**的步骤。因为文件之间的顺序是不重要的，我们不希望模型学习这种无关的顺序。
+
+### 5.3 结果保存
+
+我们可以每隔一段epoch保存一次checkpoint，大体代码如下，应该还需要添加一些修改。具体请参照Karpathy的github项目：
+
+```py
+if master_process:
+    print(f"validation loss: {val_loss_accum.item():.4f}")
+    with open(log_file, "a") as f:
+        f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+        if step > 0 and (step % 5000 == 0 or last_step):
+            # optionally write model checkpoints
+            checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'config': raw_model.config,
+                'step': step,
+                'val_loss': val_loss_accum.item()
+            }
+            # you might also want to add optimizer.state_dict() and
+            # rng seeds etc., if you wanted to more exactly resume training
+            torch.save(checkpoint, checkpoint_path)
+```
