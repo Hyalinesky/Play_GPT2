@@ -2,13 +2,13 @@
 
 本项目复现Karpathy的gpt2项目
 
-项目地址：[karpathy/nanoGPT: The simplest, fastest repository for training/finetuning medium-sized GPTs. (github.com)](https://github.com/karpathy/nanoGPT)
+原项目地址：[karpathy/nanoGPT: The simplest, fastest repository for training/finetuning medium-sized GPTs. (github.com)](https://github.com/karpathy/nanoGPT)
 
 b站视频：[【精校】“让我们重现GPT-2（1.24亿参数）!”AI大神Andrej Karpathy最新4小时经典教程 【中英】_哔哩哔哩_bilibili](https://www.bilibili.com/video/BV12s421u7sZ/?spm_id_from=333.1007.top_right_bar_window_custom_collection.content.click&vd_source=48aaa0d1fc3b556c23a01feba661a1ee)
 
-视频对应的项目地址（直到我快要完成整个项目时我才意识到这才是视频对应的项目地址，最上方的项目是旧的版本）：https://github.com/karpathy/build-nanogpt.git
+视频对应的项目地址（直到我快要完成整个项目时我才意识到这才是视频对应的项目地址，最上方的原项目是旧的版本）：https://github.com/karpathy/build-nanogpt.git
 
-**本项目**运行的文件只有train_gpt2.py
+**本项目**运行的文件只有train_gpt2.py。torch版本为2.0.1。
 
 ## 1. Before we start
 
@@ -52,7 +52,7 @@ plt.plot(sd_hf["transformer.wpe.weight"][:,200])
 plt.plot(sd_hf["transformer.wpe.weight"][:,250])
 ```
 
-![image-20240909095441231](C:\Users\16273\AppData\Roaming\Typora\typora-user-images\image-20240909095441231.png)
+![image-20240909095441231](https://img.picui.cn/free/2024/09/14/66e4d7b5ade1d.png)
 
 - 绘制的图像分别为嵌入维度为150/200/250的位置编码。注意，位置编码是一个[1024,768]的矩阵，因此绘制的曲线实际上分别是一个[1024,1]的向量。它表示了input中1024个token位置的**位置权重**。由于wpe是可学习的，因此768个维度各自对应一组位置权重，且各不相同。Perhaps，它们捕获不同维度独立的位置信息。
 - 以绿色曲线为例，该维度的位置编码prefer800-900左右的位置，而接近0的位置和900-1000左右的位置则出现明显衰减。（这提示我们，is position bias in llm come from position embedding？）
@@ -805,7 +805,7 @@ norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
 gpt训练采用的学习率是从余弦函数改造的，大体如下图所示：
 
-<img src="C:\Users\16273\AppData\Roaming\Typora\typora-user-images\image-20240912164352028.png" alt="image-20240912164352028" style="zoom:80%;" />
+<img src="https://img.picui.cn/free/2024/09/14/66e4d7b57e72e.png" alt="image-20240912164352028" style="zoom:80%;" />
 
 **学习率函数：**
 
@@ -1554,7 +1554,7 @@ plt.title("HellaSwag eval")
 print("Max Hellaswag eval:", max(ys))
 ```
 
-![image-20240913205102843](C:\Users\16273\AppData\Roaming\Typora\typora-user-images\image-20240913205102843.png)
+![image-20240913205102843](https://img.picui.cn/free/2024/09/14/66e4d7b5d67af.png)
 
 - 图表说明
   - 红色是gpt2 baseline
@@ -1567,7 +1567,7 @@ print("Max Hellaswag eval:", max(ys))
 - 实验结果的一些问题
   - 作图loss中，在接近5000steps出现了一次loss的**突变**。Karpathy认为有可能是openwebtext没有被正确的打乱，它可能继承了一些训练集中的顺序。
 
-![image-20240913210701820](C:\Users\16273\AppData\Roaming\Typora\typora-user-images\image-20240913210701820.png)
+![image-20240913210701820](https://img.picui.cn/free/2024/09/14/66e4d7b5422ec.png)
 
 - 这张图片为epoch进一步提升4倍后训练的结果。可以看到效果仍然在提升，而且loss中的“**突变**”呈现更明显的周期性。
 - 需要改进的是，dataloader加载数据时在读完文件后会返回文件开头重新读，这其中缺少一个**打乱**的步骤。因为文件之间的顺序是不重要的，我们不希望模型学习这种无关的顺序。
